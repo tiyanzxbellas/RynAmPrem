@@ -1,141 +1,185 @@
-#!/usr/bin/env node
-// RynAmPrem — CLI Alight Motion (alur magic link)
-// Entry point: menu interaktif, input pengguna, penyimpanan sesi lokal.
+const axios = require('axios')
+const crypto = require('crypto')
 const fs = require('fs')
 const path = require('path')
 const readline = require('readline')
-const auth = require('./lib/auth')
 
-// Lokasi file sesi — lokal 100% di device pengguna
-const store = path.join(__dirname, 'sessions.json')
-
-// Baca semua sesi dari disk; kembalikan {} jika file belum ada / rusak
-const load = () => {
-  try { return JSON.parse(fs.readFileSync(store, 'utf8')) } catch { return {} }
+const cfg = {
+  key: 'AIzaSyDtG1AU22ErnQD60AzBAcaknySiz9_CEq0',
+  idt: 'https://www.googleapis.com/identitytoolkit/v3/relyingparty',
+  stk: 'https://securetoken.googleapis.com/v1/token',
+  vfy: 'https://us-central1-alight-creative.cloudfunctions.net/verifyPurchase'
 }
 
-// Simpan sesi ke disk (format JSON rapi, izin file hanya untuk pemilik)
-const save = d => fs.writeFileSync(store, JSON.stringify(d, null, 2), { mode: 0o600 })
+const dip = () => [crypto.randomInt(1,255), crypto.randomInt(0,255), crypto.randomInt(0,255), crypto.randomInt(1,255)].join('.')
 
-// Normalisasi alamat email: buang spasi & samakan huruf kecil,
-// supaya lookup sesi konsisten walau format input beda-beda
-const norm = e => String(e || '').trim().toLowerCase()
-
-// Antrean baris input — tahan banting untuk terminal interaktif maupun pipe
-const rl = readline.createInterface({ input: process.stdin, output: process.stdout })
-const lines = []
-let waiter = null
-rl.on('line', l => {
-  if (waiter) { waiter(l); waiter = null } else lines.push(l)
-})
-// Ctrl+D / EOF: anggap sebagai keluar supaya tidak menggantung
-rl.on('close', () => { if (waiter) { waiter('0'); waiter = null } })
-
-// Prompt satu baris di terminal, kembalikan jawaban yang sudah di-trim
-const ask = q => new Promise(r => {
-  process.stdout.write(q)
-  if (lines.length) return r(lines.shift().trim())
-  waiter = l => r(l.trim())
+const sp = h => ({
+  ...h,
+  'x-forwarded-for': dip(),
+  'x-real-ip': dip(),
+  'client-ip': dip(),
+  'x-client-ip': dip(),
+  'x-originating-ip': dip(),
+  'x-cluster-client-ip': dip()
 })
 
-// Panggil auth.premium() dengan aman — kalau fungsi tidak tersedia, jangan crash
-const tryPremium = async idToken =>
-  typeof auth.premium === 'function'
-    ? auth.premium(idToken)
-    : { ok: false, why: 'premium tidak tersedia di build ini' }
-
-// Tampilkan menu utama
-const menu = () => console.log(`
-RynAm
-[0] keluar
-[1] kirim magic link
-[2] verifikasi link + premium
-[3] premium dari sesi
-[4] lihat sesi
-[5] cek sesi
-`)
-
-// Menu 1 — kirim magic link ke email pengguna
-async function sendLink() {
-  const email = norm(await ask('email: '))
-  const r = await auth.link(email)
-  console.log(r.ok ? 'link terkirim, cek inbox/spam' : `gagal: ${r.why}`)
+const h1 = {
+  'content-type': 'application/json',
+  'x-android-package': 'com.alightcreative.motion',
+  'x-android-cert': 'ECA6BF91B8715A6F810ED0BBFC65B6CD578F52A8',
+  'user-agent': 'dalvik/2.1.0 (linux; u; android 15; 23127pn0cc build/bp1a.250505.005)'
 }
 
-// Menu 2 — verifikasi link dari email, lalu simpan sesi
-async function verify() {
-  const email = norm(await ask('email: '))
-  const raw = await ask('link: ')
-  const v = await auth.verify(email, raw)
-  if (!v.ok) return console.log(`gagal: ${v.why}`)
-  console.log(`login ok: ${v.email} | baru: ${v.isNewUser}`)
-  const p = await tryPremium(v.idToken)
-  console.log(p.ok ? `premium aktif: ${p.order}` : `premium gagal: ${p.why}`)
-  const sessions = load()
-  sessions[norm(email)] = { uid: v.uid, refreshToken: v.refreshToken, pro: p.ok, at: new Date().toISOString() }
-  save(sessions)
-  console.log('sesi tersimpan')
+const h2 = {
+  'content-type': 'application/json; charset=utf-8',
+  'user-agent': 'okhttp/3.12.1',
+  'accept-encoding': 'gzip'
 }
 
-// Menu 3 — refresh sesi dari refreshToken yang tersimpan
-async function fromSession() {
-  const email = norm(await ask('email: '))
-  const s = load()[email]
-  if (!s) return console.log('sesi tidak ditemukan')
-  const r = await auth.refresh(s.refreshToken)
-  if (!r.ok) return console.log(`gagal: ${r.why}`)
-  const p = await tryPremium(r.idToken)
-  console.log(p.ok ? `premium aktif: ${p.order}` : `premium gagal: ${p.why}`)
+const J = JSON
+const S = String
+
+const bad = e => {
+  const d = e.response?.data
+  return d ? (typeof d === 'object' ? J.stringify(d) : S(d)) : e.message
 }
 
-// Menu 4 — daftar semua sesi yang tersimpan di device ini
-function list() {
-  const s = load()
-  const keys = Object.keys(s)
-  if (!keys.length) return console.log('kosong')
-  for (const e of keys) console.log(`${e} | uid=${s[e].uid} | pro=${s[e].pro} | ${s[e].at}`)
-}
+const inp = q => new Promise(r => {
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout })
+  rl.question(q, a => { rl.close(); r(a.trim()) })
+})
 
-// Menu 5 — cek validitas semua sesi dengan mencoba refresh token-nya
-async function check() {
-  const sessions = load()
-  const keys = Object.keys(sessions)
-  if (!keys.length) return console.log('kosong — tidak ada sesi tersimpan')
-  console.log(`memeriksa ${keys.length} sesi...`)
-  let okCount = 0
-  for (const email of keys) {
-    const s = sessions[email]
-    const r = await auth.refresh(s.refreshToken)
-    if (r.ok) {
-      okCount++
-      // Firebase bisa merotasi refresh token — simpan versi terbaru
-      sessions[email] = { ...s, refreshToken: r.refreshToken, at: new Date().toISOString() }
-      console.log(`${email} | ✓ valid`)
-    } else {
-      console.log(`${email} | ✗ ${r.why}`)
-    }
+const db = () => {
+  try { return J.parse(fs.readFileSync(path.join(__dirname, 'data.json'), 'utf8')) } catch { return {} }
+}
+const save = d => fs.writeFileSync(path.join(__dirname, 'data.json'), J.stringify(d, null, 2))
+
+async function link(email) {
+  const c1 = { identifier: email, continueUri: 'http://localhost' }
+  const c2 = {
+    requestType: 6,
+    email: email,
+    androidInstallApp: true,
+    canHandleCodeInApp: true,
+    continueUrl: 'https://alightcreative.com?ui_sid=0366624874&ui_sd=0',
+    iosBundleId: 'com.alightcreative.motion',
+    androidPackageName: 'com.alightcreative.motion',
+    androidMinimumVersion: '585',
+    clientType: 'CLIENT_TYPE_ANDROID'
   }
-  save(sessions)
-  console.log(`hasil: ${okCount}/${keys.length} sesi valid`)
+  try {
+    await axios.post(`${cfg.idt}/createAuthUri?key=${cfg.key}`, c1, { headers: sp(h1) })
+    const r = await axios.post(`${cfg.idt}/getOobConfirmationCode?key=${cfg.key}`, c2, { headers: sp(h1) })
+    return { ok: true, r: r.data }
+  } catch (e) { return { ok: false, why: bad(e) } }
 }
 
-// Entry point — tampilkan menu berulang sampai pengguna memilih 0 (keluar)
-async function main() {
-  while (true) {
-    menu()
-    const p = await ask(': ')
-    if (p === '0') return console.log('sampai jumpa 👋')
+function code(raw) {
+  if (!raw) return null
+  let s = S(raw).replace(/&amp;/g, '&')
+  try { s = decodeURIComponent(s) } catch {}
+  try {
+    const u = new URL(s)
+    let c = u.searchParams.get('oobCode')
+    if (!c) {
+      const n = u.searchParams.get('link') || u.searchParams.get('q') || u.searchParams.get('url')
+      if (n) { try { c = new URL(n).searchParams.get('oobCode') } catch {} }
+    }
+    if (c) return c.replace(/[^a-zA-Z0-9_-]/g, '')
+  } catch {}
+  const m = s.match(/oobCode=([a-zA-Z0-9_-]+)/i)
+  if (m) return m[1]
+  const t = raw.trim()
+  if (/^[a-zA-Z0-9_-]{10,}$/.test(t) && !t.includes('://')) return t
+  return null
+}
+
+async function auth(email, raw) {
+  const c = code(raw)
+  if (!c) return { ok: false, why: 'code gak ada' }
+  try {
+    const a = await axios.post(`${cfg.idt}/emailLinkSignin?key=${cfg.key}`, {
+      email: email, oobCode: c, clientType: 'CLIENT_TYPE_ANDROID'
+    }, { headers: sp(h1) })
+    let u = null
     try {
-      if (p === '1') await sendLink()
-      else if (p === '2') await verify()
-      else if (p === '3') await fromSession()
-      else if (p === '4') list()
-      else if (p === '5') await check()
-      else console.log('pilihan tidak valid')
-    } catch (e) {
-      console.error(`error: ${e.message}`)
+      const b = await axios.post(`${cfg.idt}/getAccountInfo?key=${cfg.key}`, { idToken: a.data.idToken }, { headers: sp(h1) })
+      u = b.data?.users?.[0] || null
+    } catch {}
+    return {
+      ok: true, email: email,
+      id: a.data.idToken, ref: a.data.refreshToken,
+      uid: a.data.localId, baru: !!a.data.isNewUser, user: u
     }
-  }
+  } catch (e) { return { ok: false, why: bad(e) } }
 }
 
-main().catch(e => console.error(e.message))
+async function pro(id) {
+  const o = 'neo-' + crypto.randomBytes(6).toString('hex')
+  const b = {
+    data: {
+      productId: 'am.full.sub.annual.19q4',
+      token: 'mmgaobamlahbbeccfplmbkbb.AO-J1OzqG0or_GJJIx-ms8GrTm-jaglCRfhQSRPUZKpl2YspYS-oN7_94uv8RC5vQbvd_Ios2pPDStZ2n7F0hLE3FiOU7HS3R6Fquulv5xLXFECSv4ctElw',
+      skuType: 'subs',
+      orderId: o
+    }
+  }
+  const h = {
+    ...h2,
+    authorization: 'Bearer ' + id,
+    'firebase-instance-id-token': 'cSDnCyp3T-uwp07z3tL86T:APA91bFkmvvsHw5nnqa1SBFci-99DRsKClLiETdRrVcJjS5yBx1v_FbCb1d8WhBuea_zmwnYBktyTIzcRhN4b6uNOUur9wPc0gKXmJDoZic0LhNq5V2s0xI'
+  }
+  try {
+    const r = await axios.post(cfg.vfy, b, { headers: sp(h) })
+    return { ok: true, order: o, r: r.data }
+  } catch (e) { return { ok: false, why: bad(e) } }
+}
+
+async function re(ref) {
+  try {
+    const r = await axios.post(`${cfg.stk}?key=${cfg.key}`, {
+      grant_type: 'refresh_token', refresh_token: ref
+    })
+    return { ok: true, id: r.data.id_token, ref: r.data.refresh_token }
+  } catch (e) { return { ok: false, why: bad(e) } }
+}
+
+const put = (em, d) => { const a = db(); a[em] = { ...d, at: new Date().toISOString() }; save(a) }
+const get = em => db()[em] || null
+
+async function run() {
+  console.log('[1] kirim link\n[2] verify + premium\n[3] premium (sesi)\n[4] sesi')
+  const p = await inp(': ')
+
+  if (p === '1') {
+    const em = await inp('email: ')
+    const r = await link(em)
+    console.log(r.ok ? 'cek email, copy link' : 'gagal: ' + r.why)
+  }
+
+  if (p === '2') {
+    const em = await inp('email: ')
+    const ln = await inp('link: ')
+    const v = await auth(em, ln)
+    if (!v.ok) return console.log('gagal: ' + v.why)
+    console.log('login', v.email, '| baru:', v.baru)
+    const q = await pro(v.id)
+    console.log(q.ok ? 'premium ' + q.order : 'gagal: ' + q.why)
+    put(em, { id: v.id, ref: v.ref, uid: v.uid, pro: q.ok })
+    console.log('tersimpan')
+  }
+
+  if (p === '3') {
+    const em = await inp('email: ')
+    const s = get(em)
+    if (!s) return console.log('gak ada')
+    const r = await re(s.ref)
+    if (!r.ok) return console.log('gagal: ' + r.why)
+    const q = await pro(r.id)
+    console.log(q.ok ? 'premium ' + q.order : 'gagal: ' + q.why)
+  }
+
+  if (p === '4') console.log(J.stringify(db(), null, 2))
+}
+
+if (require.main === module) run().catch(console.error)
